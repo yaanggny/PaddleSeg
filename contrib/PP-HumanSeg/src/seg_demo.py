@@ -25,6 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(__dir__, '../../../')))
 from paddleseg.utils import get_sys_env, logger, get_image_list
 
 from infer import Predictor
+import humanseg_infer as hseg
 
 
 def parse_args():
@@ -99,6 +100,11 @@ def seg_image(args):
     bg_img = get_bg_img(args.bg_img_path, img.shape)
     out_img = predictor.run(img, bg_img)
     cv2.imwrite(args.save_dir, out_img)
+
+    predictor2 = hseg.Predictor(args)
+    mask = predictor2.predict_img(img)
+    merge_img = hseg.merge_img(img, mask, bg_img)
+    cv2.imwrite('new2.jpg', merge_img)
 
 
 def seg_video(args):
@@ -210,6 +216,7 @@ def seg_camera(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    print(args)
     env_info = get_sys_env()
     args.use_gpu = True if env_info['Paddle compiled with cuda'] \
         and env_info['GPUs used'] else False
