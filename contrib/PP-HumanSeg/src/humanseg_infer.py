@@ -20,6 +20,8 @@ from paddleseg.utils import TimeAverager
 
 from optic_flow_process import optic_flow_process
 
+import matplotlib.pyplot as plt
+
 
 class DeployConfig:
     def __init__(self, path, vertical_screen):
@@ -183,6 +185,29 @@ class Predictor:
         out = (alpha * origin_img + (1 - alpha) * bg).astype(np.uint8)
         return out
 
+def crop_mask(mask, mask_th=0.5, exp_ratio=0.1):
+    h, w = mask.shape[:2]
+    mask_ = (mask > mask_th).astype(np.uint8)
+    bbox = cv2.boundingRect(mask_)
+    bx, by, bw, bh = bbox
+    offset_y = int(exp_ratio * bh)
+    offset_x = int(exp_ratio * bw)
+    keep_bottom_edge = False
+    if by + bh > h - 5:  # foreground is at bottom edge of image
+        bh = bh + offset_y
+        keep_bottom_edge = True
+    else:
+        bh = bh + 2 * offset_y
+    bw = bw + 2 * offset_x
+
+    bx = max(0, bx - offset_x)
+    by = max(0, by - offset_y)
+    by2 = min(by + bh, h)
+    bx2 = min(bx + bw, w)
+    bh = by2 - by
+    bw = bx2 - bx
+    mask_bb = mask[by:by2, bx:bx2]
+    return mask_bb, (bx, by, bw, bh), keep_bottom_edge
 
 def merge_img(img: np.ndarray, mask: np.ndarray, img_bg: np.ndarray, mask_th=0.6, crop=False, resize_factor=1.0):
     h, w = img.shape[:2]
@@ -190,30 +215,7 @@ def merge_img(img: np.ndarray, mask: np.ndarray, img_bg: np.ndarray, mask_th=0.6
     # print('img.shape, img_bg.shape: ', img.shape, img_bg.shape)
 
     # crop mask
-
-    def crop_mask(mask, exp_ratio=0.1):
-        mask_ = (mask > mask_th).astype(np.uint8)
-        bbox = cv2.boundingRect(mask_)
-        bx, by, bw, bh = bbox
-        offset_y = int(exp_ratio * bh)
-        offset_x = int(exp_ratio * bw)
-        keep_bottom_edge = False
-        if by + bh > h - 5:  # foreground is at bottom edge of image
-            bh = bh + offset_y
-            keep_bottom_edge = True
-        else:
-            bh = bh + 2 * offset_y
-        bw = bw + 2 * offset_x
-
-        bx = max(0, bx - offset_x)
-        by = max(0, by - offset_y)
-        by2 = min(by + bh, h)
-        bx2 = min(bx + bw, w)
-        bh = by2 - by
-        bw = bx2 - bx
-        mask_bb = mask[by:by2, bx:bx2]
-        return mask_bb, (bx, by, bh, bw), keep_bottom_edge
-    mask_bb, (bx, by, bh, bw), keep_bottom_edge = crop_mask(mask)
+    mask_bb, (bx, by, bw, bh), keep_bottom_edge = crop_mask(mask, mask_th)
     # print('mask.shape, mask_bb.shape, (bh, bw): ', mask.shape, mask_bb.shape, (bh, bw))
     img_bb = img[by:(by+bh), bx:(bx+bw)]
 
@@ -234,9 +236,10 @@ def merge_img(img: np.ndarray, mask: np.ndarray, img_bg: np.ndarray, mask_th=0.6
     if bh > hb or bw > wb:  # bbox larger than img_bg, need to resize mask
         resize_factor = min(hb_bh / bh, wb_bw / bw)  # minimum resize
     else:
-        # print(mask_bb.shape, (bh, bw), alpha.shape)
+        # print(img.shape, img_bg.shape, mask_bb.shape, (bh, bw), (hb_bh, wb_bw))
         resize_factor0 = min(hb_bh / bh, wb_bw / bw)  # minimum resize
         resize_factor = random.uniform(1.0, resize_factor0)
+        resize_factor = min(resize_factor, resize_factor0)
         # print(f'resize_factor: [1.0, {resize_factor0:.2f}] {resize_factor:.2f}')
     mask_bb = cv2.resize(mask_bb, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
     img_bb = cv2.resize(img_bb, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
@@ -259,3 +262,88 @@ def merge_img(img: np.ndarray, mask: np.ndarray, img_bg: np.ndarray, mask_th=0.6
     output = (alpha * output + (1 - alpha) * img_bg).astype(np.uint8)
     return output
 
+def merge_img_with_box(img: np.ndarray, img_mask: np.ndarray, bboxes: list, img_bg: np.ndarray, mask_th=0.6, crop=False, resize_factor=1.0):
+    h, w = img.shape[:2]
+    hb, wb = img_bg.shape[:2]  # h_bg, w_bg
+
+    mask_bb, (bx, by, bw, bh), keep_bottom_edge = crop_mask(img_mask, mask_th)
+    img_bb = img[by:(by+bh), bx:(bx+bw)]
+    # print(img.shape, img_mask.shape, mask_bb.shape, img_bb.shape)
+
+    # target inner region
+    border_offset_ratio = 0.05
+    border_offset_y = int(border_offset_ratio * hb)
+    border_offset_x = int(border_offset_ratio * wb)
+    if keep_bottom_edge:
+        hb_bh = hb - border_offset_y
+    else:
+        hb_bh = hb - 2 * border_offset_y
+    wb_bw = wb - 2 * border_offset_x
+
+    alpha = np.zeros((hb, wb), dtype=np.float32)
+    output = np.zeros_like(img_bg)
+
+    if bh > hb or bw > wb:  # bbox larger than img_bg, need to resize mask
+        resize_factor = min(hb_bh / bh, wb_bw / bw)  # minimum resize
+    else:
+        # print(img.shape, img_bg.shape, mask_bb.shape, (bh, bw), (hb_bh, wb_bw))
+        resize_factor0 = min(hb_bh / bh, wb_bw / bw)  # minimum resize
+        resize_factor = random.uniform((1.0 + resize_factor0)/2, resize_factor0)
+        resize_factor = min(resize_factor, resize_factor0)
+        print(f'resize_factor: [1.0, {resize_factor0:.2f}] {resize_factor:.2f}')
+    mask_bb = cv2.resize(mask_bb, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
+    img_bb = cv2.resize(img_bb, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
+    
+    mh, mw = mask_bb.shape[:2]
+    start_x = max(0, wb//2 - mw//2)  # center
+    start_y = max(0, hb//2 - mh//2)
+    start_x_min = border_offset_x
+    start_y_min = border_offset_y
+    start_x_max = max(wb - border_offset_x - mw, start_x_min)
+    start_y_max = max(hb - border_offset_y - mh, start_y_min)
+    start_x = random.randint(start_x_min, start_x_max)
+    start_y = random.randint(start_y_min, start_y_max)
+    if keep_bottom_edge:
+        start_y = hb - mh
+    alpha[start_y:start_y+mh, start_x:start_x+mw] = mask_bb
+    output[start_y:start_y+mh, start_x:start_x+mw] = img_bb
+
+    alpha = alpha[..., np.newaxis]
+    output = (alpha * output + (1 - alpha) * img_bg).astype(np.uint8)
+
+    # process bboxes
+    x2, y2 = start_x, start_y
+    bboxes2 = []
+    
+    # out_cpy = output.copy()
+    # img_cpy = img.copy()
+    # cv2.rectangle(out_cpy, (x2, y2), (x2 + mw, y2 + mh), (0, 255, 0), 2)
+    for bbox in bboxes:
+        class_id, px, py, pw, ph = bbox
+        pw = int(pw * w)
+        ph = int(ph * h)
+        px = int(px * w) - pw // 2
+        py = int(py * h) - ph // 2
+        # cv2.rectangle(img_cpy, (px, py), (px + pw, py + ph), (0, 255, 0), 2)
+        # cv2.rectangle(img_cpy, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
+        px2, py2, pw2, ph2 = px - bx, py - by, pw, ph
+
+        px3 = x2 + resize_factor* px2 
+        py3 = y2 + resize_factor* py2
+        pw3 = resize_factor * pw
+        ph3 = resize_factor * ph
+
+        # px3i, py3i, pw3i, ph3i = tuple(map(int, [px3, py3, pw3, ph3]))
+        # cv2.rectangle(out_cpy, (px3i, py3i), (px3i + pw3i, py3i + ph3i), (0, 255, 0), 2)
+
+        px3 = (2*px3 + pw3)/2 / wb
+        py3 = (2*py3 + ph3)/2 / hb
+        pw3 = pw3 / wb
+        ph3 = ph3 / hb
+        bboxes2.append((class_id, px3, py3, pw3, ph3))
+    # plt.imshow(img_cpy, cmap="gray")
+    # plt.imshow(out_cpy, cmap="gray")
+    # plt.show()
+    # plt.close()
+    
+    return output, bboxes2
